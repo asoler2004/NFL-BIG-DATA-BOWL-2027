@@ -438,9 +438,9 @@ st.session_state.setdefault("panels", [])
 # Tabs
 # --------------------------------------------------------------------------- #
 
-tab_dash, tab_rel, tab_cohort, tab_model, tab_trk, tab_sql, tab_data = st.tabs(
+tab_dash, tab_rel, tab_cohort, tab_model, tab_profile, tab_trk, tab_sql, tab_data = st.tabs(
     ["📊 Dashboard builder", "🔗 Relationship finder", "🎯 Cohorts", "🤖 Model & hidden gems",
-     "🏃 Tracking viewer", "🧮 SQL console", "🗂 Data"]
+     "👤 Player profile", "🏃 Tracking viewer", "🧮 SQL console", "🗂 Data"]
 )
 
 # ---- Dashboard builder ---------------------------------------------------- #
@@ -684,6 +684,99 @@ with tab_model:
             st.dataframe(out.sort_values("residual").head(12)
                          [["display_name", "position", "draft_overall_pick", "actual", "predicted", "residual"]]
                          .round(2), hide_index=True, width="stretch")
+
+# ---- Player profile ------------------------------------------------------- #
+with tab_profile:
+    st.markdown("Explore one player's full athletic profile, career outcomes, and drill data.")
+    if df.empty:
+        st.info("No players match the current filters.")
+    else:
+        player_labels = {
+            int(r.nfl_id): f"{r.display_name} ({r.position}, {int(r.draft_year)})"
+            for r in df[["nfl_id", "display_name", "position", "draft_year"]].dropna(subset=["nfl_id"]).itertuples()
+        }
+        selected_id = st.selectbox("Player", list(player_labels), format_func=lambda i: player_labels.get(i, str(i)))
+        player = df[df["nfl_id"] == selected_id].iloc[0]
+
+        def fmt_profile_value(v):
+            if pd.isna(v):
+                return "—"
+            if isinstance(v, (int, float, np.integer, np.floating)) and not isinstance(v, bool):
+                x = float(v)
+                if np.isclose(x, round(x)):
+                    return f"{x:.0f}"
+                return f"{x:.2f}"
+            return str(v)
+
+        c1, c2, c3, c4 = st.columns(4)
+        c1.markdown(f"### {player['display_name']}")
+        c2.metric("Position", player.get("position", "—"))
+        c3.metric("Draft year", fmt_profile_value(player.get("draft_year")))
+        c4.metric("Pick", fmt_profile_value(player.get("draft_overall_pick")))
+
+        key_stats = {
+            "forty": "40-yard",
+            "vertical": "Vertical",
+            "broad_jump": "Broad jump",
+            "bench_reps": "Bench",
+            "success_index": "Success index",
+            "career_games_started": "Games started",
+            "career_games_active": "Games active",
+            "total_snaps": "Total snaps",
+            "trk40_vmax": "Tracked max speed",
+        }
+        cards = st.columns(len(key_stats))
+        for col, (metric, label) in zip(cards, key_stats.items()):
+            with col:
+                if metric in player.index:
+                    st.metric(label, fmt_profile_value(player.get(metric)))
+                else:
+                    st.metric(label, "—")
+
+        combine_cols = [c for c in nd.COMBINE_RAW + nd.COMBINE_DERIVED + nd.COMBINE_PCT + nd.TRACK40 if c in player.index]
+        career_cols = [c for c in nd.CAREER_RAW + nd.CAREER_DERIVED if c in player.index]
+
+        combine_df = pd.DataFrame({"metric": combine_cols, "value": [player[c] for c in combine_cols]}).dropna(subset=["value"])
+        career_df = pd.DataFrame({"metric": career_cols, "value": [player[c] for c in career_cols]}).dropna(subset=["value"])
+
+        st.subheader("Combine stats")
+        st.dataframe(combine_df, hide_index=True, use_container_width=True)
+        st.subheader("Career stats")
+        st.dataframe(career_df, hide_index=True, use_container_width=True)
+
+        metric_choice = st.selectbox("Combine metric to compare against peers",
+                                    [c for c in FEATURE_COLS if c in df.columns],
+                                    index=default_idx([c for c in FEATURE_COLS if c in df.columns], "forty"))
+        if pd.isna(player.get(metric_choice)):
+            st.info(f"{player['display_name']} is missing a value for {metric_choice}.")
+        else:
+            peer = df.dropna(subset=[metric_choice]).copy()
+            fig = px.histogram(peer, x=metric_choice, nbins=30, marginal="rug",
+                               opacity=0.7, title=f"{metric_choice} distribution for current filtered cohort")
+            fig.add_vline(x=float(player[metric_choice]), line_color="red", line_dash="dash",
+                          annotation_text=f"{player['display_name']}", annotation_position="top left")
+            fig.update_layout(showlegend=False)
+            st.plotly_chart(fig, use_container_width=True)
+
+        drill_choices = [d for d in list(drill_counts.index) if d != "FORTY_YARD_DASH"]
+        if not drill_choices:
+            drill_choices = ["FORTY_YARD_DASH"]
+        drill_choice = st.selectbox("Tracking drill", drill_choices,
+                                   index=0 if "FORTY_YARD_DASH" not in drill_choices else drill_choices.index("FORTY_YARD_DASH"),
+                                   format_func=lambda d: f"{d} ({drill_counts[d]} players)")
+        tracking_view = st.radio("Tracking plot", ["path", "speed", "acceleration"], horizontal=True)
+        frames = nd.load_frames(ENGINE, drill_choice, [int(selected_id)])
+        if frames.empty:
+            st.info("No tracking frames are available for this player/drill.")
+        else:
+            if tracking_view == "path":
+                fig = px.line(frames, x="x", y="y", color="attempt", title=f"{drill_choice} path on the field")
+                fig.update_yaxes(scaleanchor="x")
+            elif tracking_view == "speed":
+                fig = px.line(frames, x="t", y="s", color="attempt", title=f"{drill_choice} speed vs time")
+            else:
+                fig = px.line(frames, x="t", y="a", color="attempt", title=f"{drill_choice} acceleration vs time")
+            st.plotly_chart(fig, use_container_width=True)
 
 # ---- Tracking viewer ------------------------------------------------------ #
 with tab_trk:
