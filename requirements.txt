@@ -1,0 +1,7 @@
+psycopg2
+rdflib
+streamlit 
+pandas 
+SPARQLWrapper 
+plotly 
+streamlit-agraph
