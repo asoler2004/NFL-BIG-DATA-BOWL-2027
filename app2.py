@@ -1,6 +1,6 @@
 """NFL Combine ↔ Career lab — Streamlit app.
 
-Run:  streamlit run app.py
+Run:  streamlit run app2.py
 """
 from __future__ import annotations
 
@@ -83,10 +83,26 @@ def cached_forty(_engine, cfg):
     return nd.load_forty_features(_engine)
 
 
+@st.cache_data(show_spinner="Summarising 2023–2025 game tracking…", ttl=3600)
+def cached_game_tracking(_engine, cfg):
+    return nd.load_game_tracking_summary(_engine)
+
+
+@st.cache_data(show_spinner="Loading selected combine tracking frames…", ttl=3600)
+def cached_combine_frames(_engine, cfg, drill_name, nfl_ids):
+    return nd.load_frames(_engine, drill_name, list(nfl_ids))
+
+
+@st.cache_data(show_spinner="Loading selected game tracking frames…", ttl=3600)
+def cached_game_frames(_engine, cfg, nfl_ids):
+    return nd.load_game_tracking_frames(_engine, list(nfl_ids))
+
+
 cfg = st.session_state["engine_cfg"][:4]  # cache key without password
 base = cached_master(ENGINE, cfg)
 trk_summary = cached_tracking_summary(ENGINE, cfg)
 forty = cached_forty(ENGINE, cfg)
+game_tracking = cached_game_tracking(ENGINE, cfg)
 
 # --------------------------------------------------------------------------- #
 # Sidebar: career definition, tracking drills, filters
@@ -106,7 +122,7 @@ with st.sidebar:
     st.subheader("Tracking drills")
     drill_counts = trk_summary.groupby("drill_name")["nfl_id"].nunique().sort_values(ascending=False)
     drills = st.multiselect(
-        "Add per-drill features (max speed, max accel, duration, distance)",
+        "Add per-drill features (speed, acceleration, angle, duration, distance)",
         [d for d in drill_counts.index if d != "FORTY_YARD_DASH"],
         format_func=lambda d: f"{d} ({drill_counts[d]})",
     )
@@ -114,6 +130,7 @@ with st.sidebar:
 master = nd.add_career_metrics(base, last_season=int(last_season))
 master["success_index"] = nd.success_index(master, idx_metrics)
 master = master.merge(forty, on="nfl_id", how="left")
+master = master.merge(game_tracking, on="nfl_id", how="left")
 drill_wide = nd.pivot_drills(trk_summary, drills)
 if len(drill_wide.columns) > 1:
     master = master.merge(drill_wide, on="nfl_id", how="left")
@@ -167,13 +184,22 @@ for c in f_need:
 # --------------------------------------------------------------------------- #
 
 UTILITY_COLS = ["movement_translation_skill_index", "movement_translation_trench_index"]
-NUMERIC = [c for c in (nd.COMBINE_RAW + nd.COMBINE_DERIVED + nd.COMBINE_PCT + nd.TRACK40 + DRILL_COLS
+NUMERIC = [c for c in (nd.COMBINE_RAW + nd.COMBINE_DERIVED + nd.COMBINE_PCT + nd.TRACK40 + nd.GAME_TRACK + DRILL_COLS
                        + nd.DRAFT_NUM + nd.CAREER_RAW + nd.CAREER_DERIVED + UTILITY_COLS) if c in df.columns]
 CAREER_COLS = [c for c in nd.CAREER_RAW + nd.CAREER_DERIVED if c in df.columns]
-FEATURE_COLS = [c for c in nd.COMBINE_RAW + nd.COMBINE_DERIVED + nd.COMBINE_PCT + nd.TRACK40 + DRILL_COLS + UTILITY_COLS
+FEATURE_COLS = [c for c in nd.COMBINE_RAW + nd.COMBINE_DERIVED + nd.COMBINE_PCT + nd.TRACK40 + nd.GAME_TRACK + DRILL_COLS + UTILITY_COLS
                 if c in df.columns]
 CATS = [c for c in nd.CATEGORICAL if c in df.columns]
 HOVER = [c for c in ["display_name", "position", "draft_year", "draft_overall_pick"] if c in df.columns]
+CORRELATION_GROUPS = {
+    "Combine results": nd.COMBINE_RAW,
+    "Derived ratios & indices": nd.COMBINE_DERIVED,
+    "40-yard tracking": nd.TRACK40,
+    "Selected drill tracking": DRILL_COLS,
+    "NFL game tracking (2023–2025)": nd.GAME_TRACK,
+    "NFL career outcomes": CAREER_COLS,
+    "Draft context": ["draft_overall_pick", "draft_round", "draft_pick_within_round", "undrafted"],
+}
 
 st.caption(f"**{len(df):,}** of {len(master):,} players match the filters · "
            f"{df['career_games_active'].notna().sum():,} with career data · "
@@ -438,9 +464,10 @@ st.session_state.setdefault("panels", [])
 # Tabs
 # --------------------------------------------------------------------------- #
 
-tab_dash, tab_rel, tab_cohort, tab_model, tab_profile, tab_trk, tab_sql, tab_data = st.tabs(
-    ["📊 Dashboard builder", "🔗 Relationship finder", "🎯 Cohorts", "🤖 Model & hidden gems",
-     "👤 Player profile", "🏃 Tracking viewer", "🧮 SQL console", "🗂 Data"]
+tab_dash, tab_rel, tab_corr, tab_cohort, tab_model, tab_profile, tab_trk, tab_insights, tab_sql, tab_data = st.tabs(
+    ["📊 Dashboard builder", "🔗 Relationship finder", "🧩 Correlation matrix", "🎯 Cohorts",
+     "🤖 Model & hidden gems", "👤 Player profile", "🏃 Tracking viewer", "📈 Jerk & spectrum",
+     "🧮 SQL console", "🗂 Data"]
 )
 
 # ---- Dashboard builder ---------------------------------------------------- #
@@ -524,12 +551,164 @@ with tab_dash:
                 st.error(f"Invalid layout: {e}")
 
 # ---- Relationship finder -------------------------------------------------- #
+with tab_corr:
+    st.markdown(
+        "Explore pairwise correlations across combine tests, body ratios, combine tracking summaries, "
+        "2023–2025 NFL game tracking, and career outcomes. Game tracking includes per-player peak/minimum "
+        "speed and acceleration, equal-play-weighted means, max direction change, and per-play distance."
+    )
+    controls = st.columns(4)
+    corr_method = controls[0].radio("Correlation", ["spearman", "pearson"], horizontal=True, key="matrix_method")
+    corr_min_n = controls[1].slider("Minimum players per pair", 5, 100, 15, key="matrix_min_n")
+    corr_scope = controls[2].selectbox(
+        "Position scope", ["All filtered players"] + sorted(df["pos_group"].dropna().unique()),
+        key="matrix_scope",
+    )
+    corr_control_pick = controls[3].checkbox("Control for log draft pick", key="matrix_control_pick")
+
+    groups_selected = st.multiselect(
+        "Metric groups",
+        list(CORRELATION_GROUPS),
+        default=[name for name in CORRELATION_GROUPS if name != "Draft context"],
+        key="matrix_groups",
+    )
+    available_matrix_cols = list(dict.fromkeys(
+        col for group in groups_selected for col in CORRELATION_GROUPS[group] if col in df.columns
+    ))
+    matrix_cols = st.multiselect(
+        "Metrics in matrix",
+        available_matrix_cols,
+        default=available_matrix_cols,
+        key="matrix_metrics",
+        help="Remove individual metrics to make a smaller, easier-to-read matrix.",
+    )
+    annotate_matrix = st.checkbox("Annotate correlation values", value=len(matrix_cols) <= 30, key="matrix_annotate")
+
+    if corr_control_pick and "log_pick" in matrix_cols:
+        st.warning("Remove log_pick from the matrix to control the other metrics for draft pick.")
+        corr_control_pick = False
+    if not matrix_cols:
+        st.info("Select at least one metric group and one metric.")
+    else:
+        corr_df = df if corr_scope == "All filtered players" else df[df["pos_group"] == corr_scope]
+        if corr_control_pick:
+            corr_data = nd.residualize(corr_df, matrix_cols, ["log_pick"])
+            st.caption("Displayed correlations use residuals after linearly controlling for log draft pick.")
+        else:
+            corr_data = corr_df[matrix_cols].apply(pd.to_numeric, errors="coerce")
+
+        corr_values = pd.DataFrame(np.nan, index=matrix_cols, columns=matrix_cols, dtype=float)
+        pair_counts = pd.DataFrame(0, index=matrix_cols, columns=matrix_cols, dtype=int)
+        for i, left in enumerate(matrix_cols):
+            for right in matrix_cols[i:]:
+                r, _, n = nd.corr_pair(corr_data[left], corr_data[right], corr_method, corr_min_n)
+                corr_values.loc[left, right] = corr_values.loc[right, left] = r
+                pair_counts.loc[left, right] = pair_counts.loc[right, left] = n
+
+        labels = corr_values.apply(
+            lambda column: column.map(lambda value: f"{value:.2f}" if pd.notna(value) else "")
+        )
+        combine_metric_cols = set(nd.COMBINE_RAW + nd.COMBINE_DERIVED + nd.COMBINE_PCT + nd.TRACK40 + DRILL_COLS)
+        game_tracking_cols = set(nd.GAME_TRACK)
+        professional_metric_cols = set(CAREER_COLS)
+        category_colors = {
+            "Combine": "#2878B5",
+            "Game tracking": "#2A9D8F",
+            "NFL career": "#E68632",
+            "Draft context": "#8C8C8C",
+        }
+        metric_categories = {
+            col: (
+                "Combine" if col in combine_metric_cols else
+                "Game tracking" if col in game_tracking_cols else
+                "NFL career" if col in professional_metric_cols else
+                "Draft context"
+            )
+            for col in matrix_cols
+        }
+        heatmap = go.Figure(go.Heatmap(
+            z=corr_values.to_numpy(),
+            x=matrix_cols,
+            y=matrix_cols,
+            customdata=pair_counts.to_numpy(),
+            text=labels,
+            texttemplate="%{text}" if annotate_matrix else None,
+            colorscale="RdBu",
+            zmin=-1,
+            zmax=1,
+            zmid=0,
+            colorbar=dict(title="r"),
+            hovertemplate="%{y} × %{x}<br>r=%{z:.3f}<br>n=%{customdata}<extra></extra>",
+        ))
+        annotations = [
+            dict(
+                x=col, y=-0.04, xref="x", yref="paper",
+                text=col, showarrow=False, textangle=-45,
+                xanchor="right", yanchor="top",
+                font=dict(color=category_colors[metric_categories[col]], size=11),
+            )
+            for col in matrix_cols
+        ] + [
+            dict(
+                x=0.30, y=row, xref="paper", yref="y",
+                text=row, showarrow=False,
+                xanchor="right", yanchor="middle",
+                font=dict(color=category_colors[metric_categories[row]], size=11),
+            )
+            for row in matrix_cols
+        ]
+        heatmap.update_layout(
+            height=max(650, min(1600, len(matrix_cols) * 20)),
+            margin=dict(l=10, r=10, t=20, b=180),
+            annotations=annotations,
+            xaxis=dict(
+                domain=[0.32, 1],
+                categoryorder="array",
+                categoryarray=matrix_cols,
+                showticklabels=False,
+            ),
+            yaxis=dict(
+                domain=[0.12, 1],
+                categoryorder="array",
+                categoryarray=matrix_cols,
+                showticklabels=False,
+                autorange="reversed",
+            ),
+        )
+        st.plotly_chart(heatmap, width="stretch")
+        st.markdown(
+            f"<span style='color:{category_colors['Combine']}'>■ Combine</span> &nbsp; "
+            f"<span style='color:{category_colors['Game tracking']}'>■ NFL game tracking (2023–2025)</span> &nbsp; "
+            f"<span style='color:{category_colors['NFL career']}'>■ NFL career</span> &nbsp; "
+            f"<span style='color:{category_colors['Draft context']}'>■ Draft context</span>",
+            unsafe_allow_html=True,
+        )
+        st.caption(
+            f"{len(matrix_cols)} metrics · {len(corr_df):,} players in scope. "
+            "Cells show pairwise-complete correlations; hover for each pair's sample size. "
+            "Treat this exploratory matrix as descriptive, not causal."
+        )
+        dl1, dl2 = st.columns(2)
+        dl1.download_button(
+            "Download correlation matrix (CSV)",
+            corr_values.to_csv(index=True),
+            "nfl_correlation_matrix.csv",
+            "text/csv",
+        )
+        dl2.download_button(
+            "Download pair counts (CSV)",
+            pair_counts.to_csv(index=True),
+            "nfl_correlation_pair_counts.csv",
+            "text/csv",
+        )
+
+# ---- Relationship finder -------------------------------------------------- #
 with tab_rel:
     st.markdown("Scan **every** feature × outcome pair, rank them, and check whether they survive "
                 "multiple-testing correction and controlling for draft pick.")
     c = st.columns(4)
     r_feats = c[0].multiselect("Feature groups", ["Combine raw", "Combine derived", "Combine percentile (within position)",
-                                                  "Tracking 40-yd", "Tracking drills"],
+                                                  "Tracking 40-yd", "Tracking drills", "NFL game tracking"],
                                default=["Combine percentile (within position)", "Tracking 40-yd"])
     r_out = c[1].multiselect("Outcomes", CAREER_COLS,
                              default=[x for x in ["success_index", "games_started_per_season", "snaps_per_season",
@@ -542,7 +721,7 @@ with tab_rel:
 
     gmap = {"Combine raw": nd.COMBINE_RAW, "Combine derived": nd.COMBINE_DERIVED,
             "Combine percentile (within position)": nd.COMBINE_PCT, "Tracking 40-yd": nd.TRACK40,
-            "Tracking drills": DRILL_COLS}
+            "Tracking drills": DRILL_COLS, "NFL game tracking": nd.GAME_TRACK}
     feats = [f for g in r_feats for f in gmap[g] if f in df.columns]
     if st.button("Scan relationships", type="primary") and feats and r_out:
         results = []
@@ -744,9 +923,13 @@ with tab_profile:
         st.subheader("Career stats")
         st.dataframe(career_df, hide_index=True, use_container_width=True)
 
+        available_metrics = [c for c in FEATURE_COLS if c in player.index and not pd.isna(player[c])]
+        if not available_metrics:
+            st.info(f"{player['display_name']} has no available feature values in the current filtered set.")
+            available_metrics = ["forty"] if "forty" in df.columns else []
         metric_choice = st.selectbox("Combine metric to compare against peers",
-                                    [c for c in FEATURE_COLS if c in df.columns],
-                                    index=default_idx([c for c in FEATURE_COLS if c in df.columns], "forty"))
+                                    available_metrics,
+                                    index=default_idx(available_metrics, "forty") if "forty" in available_metrics else 0)
         if pd.isna(player.get(metric_choice)):
             st.info(f"{player['display_name']} is missing a value for {metric_choice}.")
         else:
@@ -758,25 +941,77 @@ with tab_profile:
             fig.update_layout(showlegend=False)
             st.plotly_chart(fig, use_container_width=True)
 
-        drill_choices = [d for d in list(drill_counts.index) if d != "FORTY_YARD_DASH"]
-        if not drill_choices:
+        player_drills = set(trk_summary.loc[trk_summary["nfl_id"] == selected_id, "drill_name"].dropna().tolist())
+        drill_choices = [d for d in list(drill_counts.index) if d in player_drills and d != "FORTY_YARD_DASH"]
+        if not drill_choices and "FORTY_YARD_DASH" in player_drills:
             drill_choices = ["FORTY_YARD_DASH"]
-        drill_choice = st.selectbox("Tracking drill", drill_choices,
-                                   index=0 if "FORTY_YARD_DASH" not in drill_choices else drill_choices.index("FORTY_YARD_DASH"),
-                                   format_func=lambda d: f"{d} ({drill_counts[d]} players)")
-        tracking_view = st.radio("Tracking plot", ["path", "speed", "acceleration"], horizontal=True)
-        frames = nd.load_frames(ENGINE, drill_choice, [int(selected_id)])
-        if frames.empty:
-            st.info("No tracking frames are available for this player/drill.")
+        if not drill_choices:
+            st.info(f"{player['display_name']} has no tracking drill data in the current filters.")
         else:
-            if tracking_view == "path":
-                fig = px.line(frames, x="x", y="y", color="attempt", title=f"{drill_choice} path on the field")
-                fig.update_yaxes(scaleanchor="x")
-            elif tracking_view == "speed":
-                fig = px.line(frames, x="t", y="s", color="attempt", title=f"{drill_choice} speed vs time")
+            drill_choice = st.selectbox("Tracking drill", drill_choices,
+                                       index=0 if "FORTY_YARD_DASH" not in drill_choices else drill_choices.index("FORTY_YARD_DASH"),
+                                       format_func=lambda d: f"{d} ({drill_counts.get(d, 0)} players)")
+            tracking_view = st.radio("Tracking plot", ["path", "speed", "acceleration"], horizontal=True)
+            frames = nd.load_frames(ENGINE, drill_choice, [int(selected_id)])
+            if frames.empty:
+                st.info("No tracking frames are available for this player/drill.")
             else:
-                fig = px.line(frames, x="t", y="a", color="attempt", title=f"{drill_choice} acceleration vs time")
-            st.plotly_chart(fig, use_container_width=True)
+                if tracking_view == "path":
+                    fig = px.line(frames, x="x", y="y", color="attempt", title=f"{drill_choice} path on the field")
+                    fig.update_yaxes(scaleanchor="x")
+                elif tracking_view == "speed":
+                    fig = px.line(frames, x="t", y="s", color="attempt", title=f"{drill_choice} speed vs time")
+                else:
+                    fig = px.line(frames, x="t", y="a", color="attempt", title=f"{drill_choice} acceleration vs time")
+                st.plotly_chart(fig, use_container_width=True)
+
+        game_frames = nd.load_game_tracking_frames(ENGINE, [int(selected_id)])
+        if game_frames.empty:
+            st.info(f"{player['display_name']} has no in-game tracking data in the database.")
+        else:
+            play_choices = sorted(game_frames["play_label"].dropna().unique().tolist())
+            play_limit = min(10, len(play_choices))
+            selected_plays = st.multiselect(
+                "Game tracking plays",
+                play_choices,
+                default=play_choices[:play_limit],
+                help="Show the selected player's tracked game plays; the default focuses on the first 10 plays.",
+            )
+            if selected_plays:
+                game_view = st.radio("Game tracking view", ["path", "speed", "acceleration"], horizontal=True, key="game_track_view")
+                filtered = game_frames[game_frames["play_label"].isin(selected_plays)].copy()
+                if game_view == "path":
+                    fig = px.line(filtered, x="x", y="y", color="play_label", title=f"{player['display_name']} game path by play")
+                    fig.update_yaxes(scaleanchor="x")
+                elif game_view == "speed":
+                    fig = px.line(filtered, x="t", y="s", color="play_label", title=f"{player['display_name']} game speed vs time")
+                else:
+                    fig = px.line(filtered, x="t", y="a", color="play_label", title=f"{player['display_name']} game acceleration vs time")
+                st.plotly_chart(fig, use_container_width=True)
+
+                play_summary = (
+                    filtered.groupby("play_label", as_index=False)
+                    .agg(
+                        game_id=("game_id", "first"),
+                        play_id=("play_id", "first"),
+                        max_speed=("s", "max"),
+                        max_accel=("a", "max"),
+                        total_distance=("dis", "sum"),
+                        duration_s=("t", "max"),
+                    )
+                    .sort_values("play_id")
+                    .rename(columns={"play_label": "play"})
+                )
+                play_summary["game_id"] = play_summary["game_id"].astype(int)
+                play_summary["play_id"] = play_summary["play_id"].astype(int)
+                play_summary["max_speed"] = play_summary["max_speed"].round(2)
+                play_summary["max_accel"] = play_summary["max_accel"].round(2)
+                play_summary["total_distance"] = play_summary["total_distance"].round(2)
+                play_summary["duration_s"] = play_summary["duration_s"].round(2)
+                st.subheader("Selected game plays")
+                st.dataframe(play_summary[["play", "game_id", "play_id", "max_speed", "max_accel", "total_distance", "duration_s"]], hide_index=True, use_container_width=True)
+            else:
+                st.info("Select at least one play to display the in-game tracking chart.")
 
 # ---- Tracking viewer ------------------------------------------------------ #
 with tab_trk:
@@ -806,6 +1041,215 @@ with tab_trk:
         st.dataframe(df[df["nfl_id"].isin(chosen_ids)][cols_show], hide_index=True, width="stretch")
     else:
         st.info("Pick one or more players to overlay their runs.")
+
+# ---- Jerk and spectrum insights ------------------------------------------ #
+with tab_insights:
+    st.markdown(
+        "Inspect acceleration's time derivative (jerk) for combine drills or NFL game plays. "
+        "Jerk is estimated from adjacent acceleration samples and is reported in yd/s³. "
+        "Periodograms use linearly detrended tracks resampled at the median frame interval; "
+        "frequency summaries are exploratory, not direct measures of player quality."
+    )
+    source_col, position_col = st.columns(2)
+    tracking_source = source_col.radio(
+        "Tracking source", ["Combine", "NFL game"], horizontal=True, key="insight_source"
+    )
+    insight_positions = position_col.multiselect(
+        "Position groups",
+        sorted(df["pos_group"].dropna().unique()),
+        default=sorted(df["pos_group"].dropna().unique()),
+        key="insight_positions",
+    )
+    insight_candidates = df[df["pos_group"].isin(insight_positions)].copy()
+
+    if tracking_source == "Combine":
+        insight_drills = sorted(trk_summary["drill_name"].dropna().unique())
+        insight_drill = st.selectbox(
+            "Combine drill",
+            insight_drills,
+            index=insight_drills.index("FORTY_YARD_DASH") if "FORTY_YARD_DASH" in insight_drills else 0,
+            key="insight_drill",
+        )
+        tracked_ids = trk_summary.loc[trk_summary["drill_name"] == insight_drill, "nfl_id"]
+        insight_candidates = insight_candidates[insight_candidates["nfl_id"].isin(tracked_ids)]
+    else:
+        insight_candidates = insight_candidates[
+            insight_candidates["game_tracking_plays"].fillna(0).gt(0)
+        ]
+
+    insight_candidates = insight_candidates.sort_values("display_name")
+    insight_labels = {
+        int(row.nfl_id): f"{row.display_name} ({row.position}, {int(row.draft_year)})"
+        for row in insight_candidates.itertuples()
+    }
+    st.session_state["insight_player_ids"] = [
+        player_id for player_id in st.session_state.get("insight_player_ids", [])
+        if player_id in insight_labels
+    ][:6]
+    chosen_insight_ids = st.multiselect(
+        "Players (max 6)",
+        list(insight_labels),
+        format_func=lambda player_id: insight_labels[player_id],
+        max_selections=6,
+        key="insight_player_ids",
+        help="Choose several players to compare runs and explore spectral features against their career metrics.",
+    )
+    if not chosen_insight_ids:
+        st.info("Choose players from the selected position group(s) to load their tracking.")
+    else:
+        ids = tuple(int(player_id) for player_id in chosen_insight_ids)
+        if tracking_source == "Combine":
+            frames = cached_combine_frames(ENGINE, cfg, insight_drill, ids)
+            run_cols = ["nfl_id", "drill_name", "attempt"]
+            frames["track_label"] = (
+                frames["nfl_id"].map(insight_labels)
+                + " · attempt "
+                + frames["attempt"].astype(str)
+            )
+        else:
+            frames = cached_game_frames(ENGINE, cfg, ids)
+            run_cols = ["nfl_id", "play_key"]
+            frames["track_label"] = (
+                frames["nfl_id"].map(insight_labels) + " · " + frames["play_label"]
+            )
+
+        if frames.empty:
+            st.info("No tracking frames are available for this selection.")
+        else:
+            signals = {
+                "Distance (yd)": "distance",
+                "Speed (yd/s)": "s",
+                "Acceleration (yd/s²)": "a",
+                "Jerk (yd/s³)": "jerk",
+            }
+            metric_label = st.selectbox(
+                "Time-series signal",
+                list(signals),
+                index=3,
+                key="insight_timeseries_signal",
+            )
+            track_labels = frames["track_label"].dropna().unique().tolist()
+            st.session_state["insight_tracks"] = [
+                label for label in st.session_state.get("insight_tracks", [])
+                if label in track_labels
+            ][:8]
+            selected_tracks = st.multiselect(
+                "Runs / plays to plot (max 8)",
+                track_labels,
+                default=track_labels[: min(4, len(track_labels))],
+                max_selections=8,
+                key="insight_tracks",
+            )
+            chart_frames = frames[frames["track_label"].isin(selected_tracks)]
+            if not chart_frames.empty:
+                time_fig = px.line(
+                    chart_frames,
+                    x="t",
+                    y=signals[metric_label],
+                    color="track_label",
+                    title=f"{metric_label} over time",
+                    labels={"t": "Time (s)", signals[metric_label]: metric_label},
+                )
+                st.plotly_chart(time_fig, width="stretch")
+
+            run_stats = (
+                frames.groupby("track_label", as_index=False)
+                .agg(
+                    distance_yd=("distance", "max"),
+                    mean_speed=("s", "mean"),
+                    max_speed=("s", "max"),
+                    mean_acceleration=("a", "mean"),
+                    max_acceleration=("a", "max"),
+                    mean_jerk=("jerk", "mean"),
+                    jerk_std=("jerk", "std"),
+                    max_abs_jerk=("jerk", lambda values: values.abs().max()),
+                    jerk_samples=("jerk", "count"),
+                )
+            )
+            st.subheader("Run / play statistics")
+            st.dataframe(run_stats, hide_index=True, width="stretch")
+
+            if st.session_state.get("insight_spectrum_track") not in track_labels:
+                st.session_state.pop("insight_spectrum_track", None)
+            spectrum_track = st.selectbox(
+                "Track for spectrum",
+                track_labels,
+                key="insight_spectrum_track",
+            )
+            selected_frame = frames[frames["track_label"] == spectrum_track]
+            spectrum_parts = []
+            for signal_name, column in (
+                ("Distance", "distance"),
+                ("Speed", "s"),
+                ("Acceleration", "a"),
+                ("Jerk", "jerk"),
+            ):
+                spectrum = nd.spectrum_for_series(selected_frame["t"], selected_frame[column])
+                if not spectrum.empty:
+                    spectrum["signal"] = signal_name
+                    spectrum_parts.append(spectrum)
+            if spectrum_parts:
+                spectrum_plot = pd.concat(spectrum_parts, ignore_index=True)
+                spectrum_fig = px.line(
+                    spectrum_plot,
+                    x="frequency_hz",
+                    y="power",
+                    facet_col="signal",
+                    facet_col_wrap=2,
+                    title=f"Detrended power spectrum · {spectrum_track}",
+                    labels={"frequency_hz": "Frequency (Hz)", "power": "Power"},
+                )
+                st.plotly_chart(spectrum_fig, width="stretch")
+            else:
+                st.info("At least 8 distinct valid samples are needed for a spectrum.")
+
+            spectra = nd.tracking_spectrum_features(frames, run_cols)
+            if not spectra.empty:
+                player_spectra = spectra.groupby("nfl_id", as_index=False).mean(numeric_only=True)
+                cohort = insight_candidates.merge(player_spectra, on="nfl_id", how="inner")
+                spectrum_metrics = [
+                    column for column in spectra.columns
+                    if column.startswith("spectrum_") and cohort[column].notna().any()
+                ]
+                if spectrum_metrics and CAREER_COLS:
+                    st.subheader("Spectral features vs career outcomes")
+                    relation_cols = st.columns(3)
+                    relation_metric = relation_cols[0].selectbox(
+                        "Spectral feature", spectrum_metrics, key="insight_relation_metric"
+                    )
+                    relation_outcome = relation_cols[1].selectbox(
+                        "Career outcome",
+                        CAREER_COLS,
+                        default_idx(CAREER_COLS, "success_index"),
+                        key="insight_relation_outcome",
+                    )
+                    relation_method = relation_cols[2].radio(
+                        "Correlation", ["spearman", "pearson"], horizontal=True, key="insight_relation_method"
+                    )
+                    relation_data = cohort.dropna(subset=[relation_metric, relation_outcome])
+                    r, p, n = nd.corr_pair(
+                        relation_data[relation_metric],
+                        relation_data[relation_outcome],
+                        relation_method,
+                        min_n=5,
+                    )
+                    if n >= 5 and pd.notna(r):
+                        st.caption(f"n={n} · {relation_method.title()} r={r:.3f} · p={p:.3g}")
+                    else:
+                        st.caption(f"n={n}; at least 5 non-constant player values are needed for correlation.")
+                    relation_fig = px.scatter(
+                        relation_data,
+                        x=relation_metric,
+                        y=relation_outcome,
+                        color="pos_group",
+                        hover_data=HOVER,
+                        title=f"{relation_metric} vs {relation_outcome}",
+                    )
+                    st.plotly_chart(relation_fig, width="stretch")
+                    st.caption(
+                        "Spectral features are averaged across the selected player's runs/plays. "
+                        "Small selected-player samples are descriptive and should not be interpreted causally."
+                    )
 
 # ---- SQL console ---------------------------------------------------------- #
 with tab_sql:

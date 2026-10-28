@@ -9,7 +9,7 @@ import warnings
 
 import numpy as np
 import pandas as pd
-from scipy import stats
+from scipy import signal, stats
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import URL
 
@@ -66,7 +66,10 @@ COMBINE_RAW = [
 ]
 # metrics where a LOWER value is better (times)
 LOWER_IS_BETTER = {"ten_yd_split", "forty", "three_cone", "short_shuttle"}
-COMBINE_DERIVED = ["bmi", "speed_score", "burst", "agility_sum", "age_at_draft"]
+COMBINE_DERIVED = [
+    "bmi", "speed_score", "burst", "agility_sum", "age_at_draft",
+    "height_weight_ratio", "ape_index", "hand_arm_ratio",
+]
 COMBINE_PCT = [f"{c}_pct" for c in COMBINE_RAW if not c.startswith("ngs_")] + [
     "speed_score_pct", "burst_pct", "agility_sum_pct",
 ]
@@ -74,6 +77,16 @@ TRACK40 = [
     "trk40_vmax", "trk40_t_vmax", "trk40_amax", "trk40_v1s", "trk40_v2s",
     "trk40_t10", "trk40_t20", "trk40_t30", "trk40_t40",
     "trk40_split_10_20", "trk40_split_20_40", "trk40_speed_hold",
+    "trk40_max_angle", "trk40_mean_speed", "trk40_min_speed",
+    "trk40_mean_accel", "trk40_min_accel",
+    "trk40_mean_jerk", "trk40_max_abs_jerk",
+]
+GAME_TRACK = [
+    "game_max_speed", "game_mean_speed", "game_min_speed",
+    "game_max_accel", "game_mean_accel", "game_min_accel",
+    "game_max_angle", "game_max_play_distance", "game_mean_play_distance",
+    "game_tracking_games", "game_tracking_plays",
+    "game_mean_jerk", "game_max_abs_jerk",
 ]
 DRAFT_NUM = ["draft_overall_pick", "draft_round", "draft_pick_within_round", "pick_filled", "log_pick", "undrafted"]
 CAREER_RAW = [
@@ -169,6 +182,9 @@ def prepare_master(df: pd.DataFrame) -> pd.DataFrame:
     df["speed_score"] = df["weight"] * 200 / (df["forty"] ** 4)
     df["burst"] = df["vertical"] + df["broad_jump"]
     df["agility_sum"] = df["three_cone"] + df["short_shuttle"]
+    df["height_weight_ratio"] = df["height"] / df["weight"].where(df["weight"] > 0)
+    df["ape_index"] = df["wing_span"] / df["height"].where(df["height"] > 0)
+    df["hand_arm_ratio"] = df["hand_size"] / df["arm_length"].where(df["arm_length"] > 0)
     draft_date = pd.to_datetime(df["draft_year"].astype("Int64").astype(str) + "-04-25", errors="coerce")
     df["age_at_draft"] = (draft_date - df["birth_date"]).dt.days / 365.25
 
@@ -279,11 +295,41 @@ def within_group_percentile(df: pd.DataFrame, col: str, by: str = "position",
 def load_tracking_summary(engine) -> pd.DataFrame:
     """One row per player × drill with aggregate features (PLAYER entities only)."""
     sql = """
+    WITH tracking AS (
+        SELECT nfl_id, drill_name, attempt, "time", s, a, dis, dir,
+               LAG(a) OVER (
+                   PARTITION BY nfl_id, drill_name, attempt ORDER BY "time"
+               ) AS previous_accel,
+               LAG("time") OVER (
+                   PARTITION BY nfl_id, drill_name, attempt ORDER BY "time"
+               ) AS previous_time
+        FROM combine_tracking
+        WHERE entity_type = 'PLAYER'
+    ),
+    deltas AS (
+        SELECT *,
+               (a - previous_accel) /
+                   NULLIF(EXTRACT(EPOCH FROM ("time" - previous_time)), 0) AS jerk,
+               dir - LAG(dir) OVER (
+                   PARTITION BY nfl_id, drill_name, attempt ORDER BY "time"
+               ) AS direction_delta
+        FROM tracking
+    ),
+    frames AS (
+        SELECT *,
+               CASE WHEN ABS(direction_delta) > 180
+                    THEN 360 - ABS(direction_delta)
+                    ELSE ABS(direction_delta)
+               END AS turn_angle
+        FROM deltas
+    )
     SELECT nfl_id, drill_name, attempt,
-           MAX(s) AS max_speed, MAX(a) AS max_accel, SUM(dis) AS total_dist,
+           MAX(s) AS max_speed, MIN(s) AS min_speed, AVG(s) AS mean_speed,
+           MAX(a) AS max_accel, MIN(a) AS min_accel, AVG(a) AS mean_accel,
+           AVG(jerk) AS mean_jerk, MAX(ABS(jerk)) AS max_abs_jerk,
+           MAX(turn_angle) AS max_angle, SUM(dis) AS total_dist,
            EXTRACT(EPOCH FROM (MAX("time") - MIN("time"))) AS duration
-    FROM combine_tracking
-    WHERE entity_type = 'PLAYER'
+    FROM frames
     GROUP BY nfl_id, drill_name, attempt
     """
     with engine.connect() as conn:
@@ -294,11 +340,16 @@ def load_tracking_summary(engine) -> pd.DataFrame:
 def summarize_tracking(raw: pd.DataFrame) -> pd.DataFrame:
     raw = raw.copy()
     raw["drill_name"] = raw["drill_name"].replace(DRILL_ALIASES)
-    for c in ["max_speed", "max_accel", "total_dist", "duration"]:
+    for c in ["max_speed", "min_speed", "mean_speed", "max_accel", "min_accel",
+              "mean_accel", "mean_jerk", "max_abs_jerk", "max_angle", "total_dist", "duration"]:
         raw[c] = pd.to_numeric(raw[c], errors="coerce")
     out = (
         raw.groupby(["nfl_id", "drill_name"])
         .agg(max_speed=("max_speed", "max"), max_accel=("max_accel", "max"),
+             min_speed=("min_speed", "min"), mean_speed=("mean_speed", "mean"),
+             min_accel=("min_accel", "min"), mean_accel=("mean_accel", "mean"),
+             mean_jerk=("mean_jerk", "mean"), max_abs_jerk=("max_abs_jerk", "max"),
+             max_angle=("max_angle", "max"),
              duration=("duration", "min"), total_dist=("total_dist", "mean"),
              attempts=("attempt", "nunique"))
         .reset_index()
@@ -306,7 +357,12 @@ def summarize_tracking(raw: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def pivot_drills(summary: pd.DataFrame, drills: list[str], feats=("max_speed", "max_accel", "duration", "total_dist")) -> pd.DataFrame:
+def pivot_drills(
+    summary: pd.DataFrame,
+    drills: list[str],
+    feats=("max_speed", "max_accel", "max_angle", "mean_speed", "min_speed",
+           "mean_accel", "min_accel", "mean_jerk", "max_abs_jerk", "duration", "total_dist"),
+) -> pd.DataFrame:
     if not drills:
         return pd.DataFrame(columns=["nfl_id"])
     sub = summary[summary["drill_name"].isin(drills)]
@@ -315,9 +371,87 @@ def pivot_drills(summary: pd.DataFrame, drills: list[str], feats=("max_speed", "
     return wide.reset_index()
 
 
+def load_game_tracking_summary(engine) -> pd.DataFrame:
+    """Per-player game tracking metrics aggregated from play-level summaries."""
+    sql = """
+    WITH tracking AS (
+        SELECT nfl_id, game_id, play_id, "time", s, a, dis, dir FROM game_tracking_2023
+        UNION ALL
+        SELECT nfl_id, game_id, play_id, "time", s, a, dis, dir FROM game_tracking_2024
+        UNION ALL
+        SELECT nfl_id, game_id, play_id, "time", s, a, dis, dir FROM game_tracking_2025
+    ),
+    direction_deltas AS (
+        SELECT *,
+               LAG(a) OVER (
+                   PARTITION BY nfl_id, game_id, play_id ORDER BY "time"
+               ) AS previous_accel,
+               LAG("time") OVER (
+                   PARTITION BY nfl_id, game_id, play_id ORDER BY "time"
+               ) AS previous_time,
+               dir - LAG(dir) OVER (
+                   PARTITION BY nfl_id, game_id, play_id ORDER BY "time"
+               ) AS direction_delta
+        FROM tracking
+    ),
+    frames AS (
+        SELECT *,
+               (a - previous_accel) /
+                   NULLIF(EXTRACT(EPOCH FROM ("time" - previous_time)), 0) AS jerk,
+               CASE WHEN ABS(direction_delta) > 180
+                    THEN 360 - ABS(direction_delta)
+                    ELSE ABS(direction_delta)
+               END AS turn_angle
+        FROM direction_deltas
+    )
+    SELECT nfl_id, game_id, play_id,
+           MAX(s) AS max_speed, MIN(s) AS min_speed, AVG(s) AS mean_speed,
+           MAX(a) AS max_accel, MIN(a) AS min_accel, AVG(a) AS mean_accel,
+           AVG(jerk) AS mean_jerk, MAX(ABS(jerk)) AS max_abs_jerk,
+           MAX(turn_angle) AS max_angle, SUM(dis) AS play_distance
+    FROM frames
+    GROUP BY nfl_id, game_id, play_id
+    """
+    with engine.connect() as conn:
+        play_metrics = pd.read_sql(text(sql), conn)
+    return summarize_game_tracking(play_metrics)
+
+
+def summarize_game_tracking(play_metrics: pd.DataFrame) -> pd.DataFrame:
+    """Collapse per-play metrics to one row per player, weighting plays equally for means."""
+    columns = ["nfl_id"] + GAME_TRACK
+    if play_metrics.empty:
+        return pd.DataFrame(columns=columns)
+    numeric = [
+        "max_speed", "min_speed", "mean_speed", "max_accel", "min_accel",
+        "mean_accel", "mean_jerk", "max_abs_jerk", "max_angle", "play_distance",
+    ]
+    data = play_metrics.copy()
+    for col in numeric:
+        data[col] = pd.to_numeric(data[col], errors="coerce")
+    out = data.groupby("nfl_id").agg(
+        game_max_speed=("max_speed", "max"),
+        game_mean_speed=("mean_speed", "mean"),
+        game_min_speed=("min_speed", "min"),
+        game_max_accel=("max_accel", "max"),
+        game_mean_accel=("mean_accel", "mean"),
+        game_min_accel=("min_accel", "min"),
+        game_mean_jerk=("mean_jerk", "mean"),
+        game_max_abs_jerk=("max_abs_jerk", "max"),
+        game_max_angle=("max_angle", "max"),
+        game_max_play_distance=("play_distance", "max"),
+        game_mean_play_distance=("play_distance", "mean"),
+        game_tracking_games=("game_id", "nunique"),
+        game_tracking_plays=("play_id", "count"),
+    )
+    out["game_tracking_games"] = out["game_tracking_games"].astype(int)
+    out["game_tracking_plays"] = out["game_tracking_plays"].astype(int)
+    return out.reset_index()[columns]
+
+
 def load_forty_features(engine) -> pd.DataFrame:
     sql = """
-    SELECT nfl_id, attempt, "time", s, a, dis
+    SELECT nfl_id, attempt, "time", s, a, dis, dir
     FROM combine_tracking
     WHERE entity_type = 'PLAYER' AND drill_name = 'FORTY_YARD_DASH'
     """
@@ -332,17 +466,31 @@ def _one_forty(g: pd.DataFrame, start_speed: float = 1.0) -> dict | None:
     s = pd.to_numeric(g["s"], errors="coerce").to_numpy(float)
     a = pd.to_numeric(g["a"], errors="coerce").to_numpy(float)
     d = np.nan_to_num(pd.to_numeric(g["dis"], errors="coerce").to_numpy(float))
+    direction = pd.to_numeric(g.get("dir", pd.Series(np.nan, index=g.index)), errors="coerce").to_numpy(float)
     moving = np.where(s > start_speed)[0]
     if len(moving) < 5:
         return None
     i0 = moving[0]
-    t, s, a, d = tsec[i0:] - tsec[i0], s[i0:], a[i0:], d[i0:]
+    t, s, a, d, direction = tsec[i0:] - tsec[i0], s[i0:], a[i0:], d[i0:], direction[i0:]
     cum = np.cumsum(d)
     vmax_i = int(np.nanargmax(s))
+    turn_angles = np.abs((np.diff(direction) + 180) % 360 - 180)
+    finite_speed = s[np.isfinite(s)]
+    finite_accel = a[np.isfinite(a)]
+    finite_turn = turn_angles[np.isfinite(turn_angles)]
+    jerk = np.gradient(a, t) if len(t) > 1 and np.all(np.diff(t) > 0) else np.full(len(a), np.nan)
+    finite_jerk = jerk[np.isfinite(jerk)]
     out = {
         "trk40_vmax": float(s[vmax_i]),
         "trk40_t_vmax": float(t[vmax_i]),
         "trk40_amax": float(np.nanmax(a)),
+        "trk40_min_speed": float(np.min(finite_speed)) if finite_speed.size else np.nan,
+        "trk40_mean_speed": float(np.mean(finite_speed)) if finite_speed.size else np.nan,
+        "trk40_min_accel": float(np.min(finite_accel)) if finite_accel.size else np.nan,
+        "trk40_mean_accel": float(np.mean(finite_accel)) if finite_accel.size else np.nan,
+        "trk40_mean_jerk": float(np.mean(finite_jerk)) if finite_jerk.size else np.nan,
+        "trk40_max_abs_jerk": float(np.max(np.abs(finite_jerk))) if finite_jerk.size else np.nan,
+        "trk40_max_angle": float(np.max(finite_turn)) if finite_turn.size else np.nan,
         "trk40_v1s": float(np.interp(1.0, t, s)) if t[-1] >= 1.0 else np.nan,
         "trk40_v2s": float(np.interp(2.0, t, s)) if t[-1] >= 2.0 else np.nan,
     }
@@ -393,8 +541,139 @@ def load_frames(engine, drill_name: str, nfl_ids: list[int]) -> pd.DataFrame:
         df = pd.read_sql(sql, conn, params={"names": names, "ids": [int(i) for i in nfl_ids]})
     for c in ["x", "y", "s", "a", "dis", "dir"]:
         df[c] = pd.to_numeric(df[c], errors="coerce")
-    df["t"] = df.groupby(["nfl_id", "attempt"])["time"].transform(lambda x: (x - x.min()).dt.total_seconds())
-    return df
+    group_cols = ["nfl_id", "drill_name", "attempt"]
+    df["t"] = df.groupby(group_cols)["time"].transform(lambda x: (x - x.min()).dt.total_seconds())
+    df["distance"] = df.groupby(group_cols)["dis"].cumsum()
+    return add_jerk(df, group_cols)
+
+
+def add_jerk(frames: pd.DataFrame, group_cols: list[str]) -> pd.DataFrame:
+    """Add acceleration's time derivative (yd/s³) independently within each track."""
+    out = frames.copy()
+    out["jerk"] = np.nan
+    if out.empty or "t" not in out or "a" not in out:
+        return out
+    for _, group in out.groupby(group_cols, sort=False, dropna=False):
+        t = pd.to_numeric(group["t"], errors="coerce").to_numpy(float)
+        accel = pd.to_numeric(group["a"], errors="coerce").to_numpy(float)
+        valid = np.isfinite(t) & np.isfinite(accel)
+        valid_positions = np.flatnonzero(valid)
+        if len(valid_positions) < 2:
+            continue
+        valid_times = t[valid]
+        unique_times, unique_idx = np.unique(valid_times, return_index=True)
+        if len(unique_times) < 2:
+            continue
+        unique_accel = accel[valid_positions[unique_idx]]
+        jerk = np.gradient(unique_accel, unique_times)
+        out.loc[group.index[valid_positions[unique_idx]], "jerk"] = jerk
+    return out
+
+
+def prepare_game_tracking_frames(df: pd.DataFrame) -> pd.DataFrame:
+    """Clean in-game tracking rows for a single player or a small group of players."""
+    if df.empty:
+        return df.copy()
+    out = df.copy()
+    out["time"] = pd.to_datetime(out["time"], errors="coerce")
+    out = out.dropna(subset=["nfl_id", "game_id", "play_id", "time"]).copy()
+    for c in ["x", "y", "s", "a", "dis", "o", "dir"]:
+        out[c] = pd.to_numeric(out[c], errors="coerce")
+    out = out.sort_values(["nfl_id", "game_id", "play_id", "time"]).reset_index(drop=True)
+    out["play_key"] = out["game_id"].astype(str) + "_" + out["play_id"].astype(str)
+    out["play_label"] = out["game_id"].astype(str) + " · play " + out["play_id"].astype(str)
+    out["t"] = out.groupby(["nfl_id", "play_key"])["time"].transform(lambda x: (x - x.min()).dt.total_seconds())
+    out["distance"] = out.groupby(["nfl_id", "play_key"])["dis"].cumsum()
+    return add_jerk(out, ["nfl_id", "play_key"])
+
+
+def load_game_tracking_frames(engine, nfl_ids: list[int]) -> pd.DataFrame:
+    """Union all game tracking tables for the selected players and prepare them for plotting."""
+    if not nfl_ids:
+        return pd.DataFrame(columns=["nfl_id", "game_id", "play_id", "time", "x", "y", "s", "a", "dis", "o", "dir", "event"])
+    ids = [int(i) for i in nfl_ids]
+    sql = text(
+        """
+        SELECT nfl_id, game_id, play_id, time, x, y, s, a, dis, o, dir, event
+        FROM game_tracking_2023
+        WHERE nfl_id = ANY(:ids)
+        UNION ALL
+        SELECT nfl_id, game_id, play_id, time, x, y, s, a, dis, o, dir, event
+        FROM game_tracking_2024
+        WHERE nfl_id = ANY(:ids)
+        UNION ALL
+        SELECT nfl_id, game_id, play_id, time, x, y, s, a, dis, o, dir, event
+        FROM game_tracking_2025
+        WHERE nfl_id = ANY(:ids)
+        ORDER BY nfl_id, game_id, play_id, time
+        """
+    )
+    with engine.connect() as conn:
+        df = pd.read_sql(sql, conn, params={"ids": ids})
+    return prepare_game_tracking_frames(df)
+
+
+def spectrum_for_series(time: pd.Series, values: pd.Series, min_samples: int = 8) -> pd.DataFrame:
+    """Return a detrended periodogram after resampling a track to its median frame interval."""
+    t = pd.to_numeric(time, errors="coerce").to_numpy(float)
+    y = pd.to_numeric(values, errors="coerce").to_numpy(float)
+    valid = np.isfinite(t) & np.isfinite(y)
+    t, y = t[valid], y[valid]
+    if len(t) < min_samples:
+        return pd.DataFrame(columns=["frequency_hz", "power"])
+    order = np.argsort(t)
+    t, y = t[order], y[order]
+    t, unique_idx = np.unique(t, return_index=True)
+    y = y[unique_idx]
+    if len(t) < min_samples:
+        return pd.DataFrame(columns=["frequency_hz", "power"])
+    dt = float(np.median(np.diff(t)))
+    if not np.isfinite(dt) or dt <= 0:
+        return pd.DataFrame(columns=["frequency_hz", "power"])
+    sample_times = np.arange(t[0], t[-1] + dt * 0.25, dt)
+    if len(sample_times) < min_samples:
+        return pd.DataFrame(columns=["frequency_hz", "power"])
+    sampled = np.interp(sample_times, t, y)
+    frequencies, power = signal.periodogram(
+        sampled, fs=1 / dt, detrend="linear", scaling="spectrum"
+    )
+    return pd.DataFrame({"frequency_hz": frequencies[1:], "power": power[1:]})
+
+
+def tracking_spectrum_features(
+    frames: pd.DataFrame, group_cols: list[str]
+) -> pd.DataFrame:
+    """Summarize non-zero spectral peaks for distance, speed, acceleration and jerk per track."""
+    feature_columns = [
+        f"spectrum_{signal_name}_{metric}"
+        for signal_name in ["distance", "s", "a", "jerk"]
+        for metric in ["peak_hz", "centroid_hz", "peak_power"]
+    ]
+    records = []
+    signals = {"distance": "distance", "s": "s", "a": "a", "jerk": "jerk"}
+    if frames.empty:
+        return pd.DataFrame(columns=group_cols + feature_columns)
+    for keys, group in frames.groupby(group_cols, sort=False, dropna=False):
+        keys = keys if isinstance(keys, tuple) else (keys,)
+        record = dict(zip(group_cols, keys))
+        for name, column in signals.items():
+            spectrum = spectrum_for_series(group["t"], group[column])
+            if spectrum.empty:
+                record[f"spectrum_{name}_peak_hz"] = np.nan
+                record[f"spectrum_{name}_centroid_hz"] = np.nan
+                record[f"spectrum_{name}_peak_power"] = np.nan
+                continue
+            frequencies = spectrum["frequency_hz"].to_numpy(float)
+            power = spectrum["power"].to_numpy(float)
+            peak_idx = int(np.argmax(power))
+            total_power = float(np.sum(power))
+            record[f"spectrum_{name}_peak_hz"] = float(frequencies[peak_idx])
+            record[f"spectrum_{name}_centroid_hz"] = (
+                float(np.sum(frequencies * power) / total_power) if total_power > 0 else np.nan
+            )
+            record[f"spectrum_{name}_peak_power"] = float(power[peak_idx])
+        records.append(record)
+    return pd.DataFrame(records, columns=group_cols + feature_columns)
 
 
 # --------------------------------------------------------------------------- #
